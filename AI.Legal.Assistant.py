@@ -1,10 +1,4 @@
-import os
-import operator
-from typing import TypedDict, Annotated
-
 import gradio as gr
-
-from langgraph.graph import StateGraph, START, END
 
 from langchain_core.messages import (
     HumanMessage,
@@ -14,22 +8,13 @@ from langchain_core.messages import (
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-
 from openrouter import OpenRouter
 
 
 # =========================================================
-# 1. DEFINE STATE
+# 1. VECTOR DB
 # =========================================================
-class State(TypedDict):
-    messages: Annotated[list, operator.add]
-    memory: str
-
-
-# =========================================================
-# 2. LOAD VECTOR DATABASE
-# =========================================================
-print("📚 Loading vector database...")
+print("📚 Loading vector DB...")
 
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-mpnet-base-v2"
@@ -40,430 +25,330 @@ db = Chroma(
     embedding_function=embedding_model
 )
 
-retriever = db.as_retriever(
-    search_type="similarity_score_threshold",
-    search_kwargs={
-        "k": 5,
-        "score_threshold": 0.55
-    }
+retriever = db.as_retriever(search_kwargs={"k": 5})
+
+print("✅ Vector DB ready")
+
+
+# =========================================================
+# 2. OPENROUTER
+# =========================================================
+client = OpenRouter(
+    api_key="API Key"
 )
 
-print("✅ Vector DB loaded")
-
-
 
 # =========================================================
-# 3. INITIALIZE OPENROUTER
+# 3. STREAM LLM
 # =========================================================
+def stream_llm(messages):
 
+    formatted = []
 
-openrouter_client = OpenRouter(api_key="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")
+    for m in messages:
 
-print("✅ OpenRouter initialized")
+        if hasattr(m, "content"):
 
+            content = m.content
 
-# =========================================================
-# 4. LLM INVOKE FUNCTION
-# =========================================================
-def llm_invoke(messages_list, model="z-ai/glm-4.5-air:free"):
+            if not content:
+                continue
 
-    formatted_messages = []
+            if isinstance(m, SystemMessage):
+                role = "system"
 
-    for msg in messages_list:
+            elif isinstance(m, HumanMessage):
+                role = "user"
 
-        if isinstance(msg, SystemMessage):
-            role = "system"
+            elif isinstance(m, AIMessage):
+                role = "assistant"
 
-        elif isinstance(msg, HumanMessage):
-            role = "user"
-
-        elif isinstance(msg, AIMessage):
-            role = "assistant"
+            else:
+                continue
 
         else:
-            continue
 
-        formatted_messages.append({
+            role = m.get("role")
+            content = m.get("content")
+
+            if not content:
+                continue
+
+        formatted.append({
             "role": role,
-            "content": msg.content
+            "content": str(content)
         })
 
-    response = openrouter_client.chat.send(
-        model=model,
-        messages=formatted_messages
+    return client.chat.send(
+        model="z-ai/glm-4.5-air:free",
+        messages=formatted,
+        stream=True
     )
 
-    return response
-
 
 # =========================================================
-# 5. WORD COUNT
+# 4. RAG CONTEXT
 # =========================================================
-def word_count(text: str) -> int:
-    return len(text.split())
+def get_context(query: str):
 
-
-# =========================================================
-# 6. MEMORY SUMMARIZATION
-# =========================================================
-def summarize_memory(memory: str) -> str:
-
-    response = llm_invoke([
-
-        SystemMessage(content="""
-Summarize the conversation into
-3 concise sentences while preserving
-important facts and context.
-"""),
-
-        HumanMessage(content=memory)
-
-    ])
-
-    summary = response.choices[0].message.content.strip()
-
-    print("🧾 Memory summarized")
-
-    return summary
-
-
-# =========================================================
-# 7. NORMAL CHAT
-# =========================================================
-def normal_chat(query, memory, messages):
-
-    response = llm_invoke([
-
-        SystemMessage(content=f"""
-You are a helpful assistant.
-
-Conversation memory:
-{memory}
-
-Answer naturally and briefly.
-""")
-
-    ] + messages)
-
-    answer = response.choices[0].message.content
-
-    return answer
-
-
-# =========================================================
-# 8. RAG CHAT
-# =========================================================
-def rag_chat(query, memory):
-
-    print("📚 Running RAG retrieval...")
-    print("Query",query)
-    # -----------------------------------------------------
-    # Retrieve docs
-    # -----------------------------------------------------
     docs = retriever.invoke(query)
 
-    # -----------------------------------------------------
-    # No docs found → fallback
-    # -----------------------------------------------------
     if not docs:
+        return ""
 
-        print("⚠️ No relevant docs found")
+    return "\n\n".join(
+        f"DOC {i+1}\n{d.page_content}"
+        for i, d in enumerate(docs)
+    )
 
-        return None
+
+# =========================================================
+# 5. CREATE NEW TOPIC
+# =========================================================
+def create_topic(sessions):
+
+    topic_name = f"New Chat {len(sessions) + 1}"
+
+    sessions[topic_name] = {
+        "history": [],
+        "memory": ""
+    }
+
+    return (
+        sessions,
+        gr.update(
+            choices=list(sessions.keys()),
+            value=topic_name
+        ),
+        []
+    )
+
+
+# =========================================================
+# 6. SWITCH TOPIC
+# =========================================================
+def switch_topic(selected_topic, sessions):
+
+    return sessions[selected_topic]["history"]
+
+
+# =========================================================
+# 7. CHAT FUNCTION
+# =========================================================
+def chat_stream(
+    message,
+    history,
+    selected_topic,
+    sessions
+):
+
+    if not selected_topic:
+        return "", history, sessions
+
+    current = sessions[selected_topic]
+
+    history = current["history"]
+    memory = current["memory"]
 
     # -----------------------------------------------------
-    # Build context
+    # RAG CONTEXT
     # -----------------------------------------------------
-    context_parts = []
+    context = get_context(message)
 
-    for i, doc in enumerate(docs):
+    system_prompt = f"""
+You are a legal assistant.
 
-        context_parts.append(
-            f"""
-DOCUMENT {i+1}
-
-{doc.page_content}
-"""
-        )
-
-    context = "\n\n".join(context_parts)
-
-    # -----------------------------------------------------
-    # Prompt
-    # -----------------------------------------------------
-    messages = [
-
-        SystemMessage(content="""
-You are a legal RAG assistant.
-
-Use ONLY the provided context.
-
-Rules:
-- If answer is not in context, say:
-  "I don't know based on the provided documents."
-- Do not invent laws
-- Do not hallucinate
-- Quote relevant legal text when possible
-- Keep answers concise and accurate
-"""),
-
-        HumanMessage(content=f"""
-Conversation memory:
+Memory:
 {memory}
 
 Context:
-{context}
-
-Question:
-{query}
-""")
-    ]
-
-    # -----------------------------------------------------
-    # LLM
-    # -----------------------------------------------------
-    response = llm_invoke(messages)
-
-    answer = response.choices[0].message.content
-
-    print("💬 RAG Answer:", answer)
-
-    return answer
-
-
-# =========================================================
-# 9. MAIN CHAT ROUTER
-# =========================================================
-def chatbot_node(state: State):
-
-    query = state["messages"][-1].content
-
-    memory = state.get("memory", "")
-
-    print(f"\n👤 User: {query}")
-
-    # -----------------------------------------------------
-    # Try RAG first
-    # -----------------------------------------------------
-    rag_answer = rag_chat(query, memory)
-
-    # -----------------------------------------------------
-    # If no docs → normal chat
-    # -----------------------------------------------------
-    if rag_answer is None:
-
-        print("🤖 Falling back to normal chat")
-
-        answer = normal_chat(
-            query=query,
-            memory=memory,
-            messages=state["messages"]
-        )
-
-    else:
-        answer = rag_answer
-
-    assistant_message = AIMessage(content=answer)
-
-    # -----------------------------------------------------
-    # Update memory
-    # -----------------------------------------------------
-    new_memory = memory + f"""
-
-User: {query}
-
-Assistant: {answer}
+{context if context else "No relevant documents found."}
 """
 
-    # -----------------------------------------------------
-    # Summarize memory if too large
-    # -----------------------------------------------------
-    if word_count(new_memory) > 2000:
-        new_memory = summarize_memory(new_memory)
-
-    return {
-        **state,
-        "messages": state["messages"] + [assistant_message],
-        "memory": new_memory
-    }
-
-
-# =========================================================
-# 10. BUILD GRAPH
-# =========================================================
-print("⚙️ Building LangGraph...")
-
-graph_builder = StateGraph(State)
-
-graph_builder.add_node(
-    "chatbot",
-    chatbot_node
-)
-
-graph_builder.add_edge(
-    START,
-    "chatbot"
-)
-
-graph_builder.add_edge(
-    "chatbot",
-    END
-)
-
-graph = graph_builder.compile()
-
-print("✅ Graph ready")
-
-
-# =========================================================
-# 11. RESPONSE FUNCTION
-# =========================================================
-def respond(user_message, chat_history, memory):
-
-    chat_history = chat_history or []
-    memory = memory or ""
-
-    # -----------------------------------------------------
-    # Convert history to LangChain messages
-    # -----------------------------------------------------
-    messages = []
-
-    for msg in chat_history:
-
-        if msg["role"] == "user":
-
-            messages.append(
-                HumanMessage(content=msg["content"])
-            )
-
-        elif msg["role"] == "assistant":
-
-            messages.append(
-                AIMessage(content=msg["content"])
-            )
-
-    # -----------------------------------------------------
-    # Add current user message
-    # -----------------------------------------------------
-    messages.append(
-        HumanMessage(content=user_message)
-    )
-
-    # -----------------------------------------------------
-    # Invoke graph
-    # -----------------------------------------------------
-    result = graph.invoke({
-        "messages": messages,
-        "memory": memory
-    })
-
-    answer = result["messages"][-1].content
-
-    new_memory = result.get("memory", memory)
-
-    # -----------------------------------------------------
-    # Update Gradio history
-    # -----------------------------------------------------
-    updated_history = chat_history + [
-
-        {
-            "role": "user",
-            "content": user_message
-        },
-
-        {
-            "role": "assistant",
-            "content": answer
-        }
+    messages = [
+        SystemMessage(content=system_prompt)
     ]
 
-    return "", updated_history, new_memory
+    for msg in history:
+        messages.append(msg)
+
+    messages.append({
+        "role": "user",
+        "content": message
+    })
+
+    # -----------------------------------------------------
+    # STREAM RESPONSE
+    # -----------------------------------------------------
+    response = stream_llm(messages)
+
+    full = ""
+
+    history.append({
+        "role": "user",
+        "content": message
+    })
+
+    history.append({
+        "role": "assistant",
+        "content": ""
+    })
+
+    yield "", history, sessions
+
+    for chunk in response:
+
+        delta = getattr(
+            chunk.choices[0].delta,
+            "content",
+            ""
+        )
+
+        if delta:
+
+            full += delta
+
+            history[-1]["content"] = full
+
+            yield "", history, sessions
+
+    # -----------------------------------------------------
+    # SAVE MEMORY
+    # -----------------------------------------------------
+    memory += f"\nUser: {message}\nAssistant: {full}\n"
+
+    current["history"] = history
+    current["memory"] = memory
+
+    sessions[selected_topic] = current
+
+    yield "", history, sessions
 
 
 # =========================================================
-# 12. GRADIO UI
+# 8. INITIAL STATE
 # =========================================================
-with gr.Blocks(title="Advanced LangGraph RAG Chatbot") as app:
+default_sessions = {
+    "New Chat 1": {
+        "history": [],
+        "memory": ""
+    }
+}
 
-    gr.Markdown("# 🤖 Advanced LangGraph RAG Chatbot")
 
-    chatbot = gr.Chatbot(height=600)
+# =========================================================
+# 9. UI
+# =========================================================
+with gr.Blocks(
+    title="ChatGPT Style RAG",
+    theme=gr.themes.Soft()
+) as app:
 
-    memory_state = gr.State("")
+    sessions_state = gr.State(default_sessions)
 
     with gr.Row():
 
-        text = gr.Textbox(
-            placeholder="Ask a legal question...",
-            show_label=False,
-            scale=8
-        )
+        # =================================================
+        # SIDEBAR
+        # =================================================
+        with gr.Column(scale=1):
 
-        send_btn = gr.Button(
-            "🚀 Send",
-            variant="primary",
-            scale=1
-        )
+            gr.Markdown("## 💬 Conversations")
 
-        clear_btn = gr.Button(
-            "🗑️ Clear",
-            variant="stop",
-            scale=1
-        )
+            new_chat_btn = gr.Button(
+                "➕ New Chat",
+                variant="primary"
+            )
 
-    # -----------------------------------------------------
-    # Send button
-    # -----------------------------------------------------
+            topic_list = gr.Radio(
+                choices=list(default_sessions.keys()),
+                value="New Chat 1",
+                show_label=False
+            )
+
+        # =================================================
+        # MAIN CHAT
+        # =================================================
+        with gr.Column(scale=4):
+
+            chatbot = gr.Chatbot(
+                height=700
+            )
+
+            with gr.Row():
+
+                txt = gr.Textbox(
+                    placeholder="Ask something...",
+                    show_label=False,
+                    scale=8
+                )
+
+                send_btn = gr.Button(
+                    "Send",
+                    scale=1
+                )
+
+    # =====================================================
+    # CREATE NEW CHAT
+    # =====================================================
+    new_chat_btn.click(
+        create_topic,
+        inputs=[sessions_state],
+        outputs=[
+            sessions_state,
+            topic_list,
+            chatbot
+        ]
+    )
+
+    # =====================================================
+    # SWITCH CHAT
+    # =====================================================
+    topic_list.change(
+        switch_topic,
+        inputs=[
+            topic_list,
+            sessions_state
+        ],
+        outputs=[chatbot]
+    )
+
+    # =====================================================
+    # SEND MESSAGE
+    # =====================================================
     send_btn.click(
-        fn=respond,
+        chat_stream,
         inputs=[
-            text,
+            txt,
             chatbot,
-            memory_state
+            topic_list,
+            sessions_state
         ],
         outputs=[
-            text,
+            txt,
             chatbot,
-            memory_state
+            sessions_state
         ]
     )
 
-    # -----------------------------------------------------
-    # Press enter
-    # -----------------------------------------------------
-    text.submit(
-        fn=respond,
+    txt.submit(
+        chat_stream,
         inputs=[
-            text,
+            txt,
             chatbot,
-            memory_state
+            topic_list,
+            sessions_state
         ],
         outputs=[
-            text,
+            txt,
             chatbot,
-            memory_state
-        ]
-    )
-
-    # -----------------------------------------------------
-    # Clear chat
-    # -----------------------------------------------------
-    clear_btn.click(
-        fn=lambda: ([], ""),
-        inputs=None,
-        outputs=[
-            chatbot,
-            memory_state
+            sessions_state
         ]
     )
 
 
 # =========================================================
-# 13. RUN APP
+# 10. RUN
 # =========================================================
-print("🚀 Launching Gradio app...")
-
-app.launch(
-    share=False,
-    inbrowser=True
-)
+app.queue()
+app.launch(inbrowser=True)
